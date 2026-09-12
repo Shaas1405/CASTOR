@@ -1,0 +1,4 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "custom_modules") (type "KiCad") (uri "E:/big bad project of doom/custom_modules.pretty") (options "") (descr ""))
+)
