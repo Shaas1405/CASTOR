@@ -275,7 +275,7 @@ void parse_send_command(char* input) {
   *last_quote = '\0';  // Extracted payload isolated here
 
   ESP_LOGI(TAG, "Extracted Message: [%s]", message);
-  send_message("SOS", COMP_ID, 5, 0, PACKET_TEXT);
+  send_message(message, COMP_ID, 5, 0, PACKET_TEXT);
 }
 
 char* handle_serial_stream(void) {
