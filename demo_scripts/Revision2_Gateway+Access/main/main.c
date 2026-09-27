@@ -29,18 +29,13 @@ static const char* TAG = "CASTOR_GW";
 
 // Local network the gateway stands up
 #define AP_SSID "CASTOR-GATEWAY"
-#define AP_PASSWORD \
-  "castor-relief"  // REVIEW: 8+ chars required by WPA2; pick a real one
+#define AP_PASSWORD "castor-relief"  // SHould get rid of
 #define AP_CHANNEL 6
 #define AP_MAX_CONN 8
 
-// Turn this on only once you have a real endpoint; left off so the firmware
-// doesn't silently try to POST into the void during bench testing.
 #define ENABLE_EMS_FORWARDING 1
 #define EMS_ENDPOINT_URL \
   "https://webhook.site/d7ff6cd0-6971-4d9c-a34e-fea1511bbe3f"
-
-#define GATEWAY_BEACON_INTERVAL_MS 10000
 
 static bool wifi_is_connected = false;
 static esp_netif_t* ap_netif = NULL;
@@ -52,15 +47,18 @@ const char* hostname = "castor-node";
 #pragma region Node role state machine
 
 typedef enum {
-  ROLE_MESH_ONLY = 0,
-  ROLE_GATEWAY = 1,
+  ROLE_ACCESS = 0,
+  ROLE_UPLINK = 1,
 } node_role_t;
 
-static node_role_t current_role = ROLE_MESH_ONLY;
+static node_role_t current_role = ROLE_ACCESS;
+
 static httpd_handle_t gw_http_server = NULL;
 
-static void become_gateway(void);
-static void step_down_from_gateway(void);
+static void become_uplink(void);
+static void remain_access(void);
+static void disable_access_services(void);
+
 static httpd_handle_t start_gateway_webserver(void);
 static void stop_gateway_webserver(httpd_handle_t server);
 static esp_err_t captive_portal_redirect_handler(httpd_req_t* req);
@@ -79,8 +77,7 @@ typedef enum {
   PACKET_TEXT = 0,
   PACKET_LOCATION = 1,
   PACKET_IMAGE = 2,
-  PACKET_SOS = 3,             // was folded into PACKET_TEXT in Rev1; split out
-  PACKET_GATEWAY_BEACON = 4,  // new: "a gateway is alive nearby"
+  PACKET_SOS = 3,  // No more packet for gateway beacon, no need anymore
 } PacketType;
 
 typedef struct {
@@ -92,6 +89,9 @@ typedef struct {
 } PacketStruct;
 
 uint8_t rx_buffer[256];
+
+#define LORA_TX_QUEUE_SIZE 16
+static QueueHandle_t lora_tx_queue = NULL;
 
 #pragma endregion  // Node identity & packet definitions
 
@@ -121,6 +121,7 @@ void wait_for_button_release(gpio_num_t button) {
 
 void LoRa_setup(void) {
   LoRaInit();
+  LoRaDebugPrint(true);
   LoRaBegin(915000000, 22, 3.3, false);
   LoRaConfig(7, SX126X_LORA_BW_125_0, SX126X_LORA_CR_4_5, 8, 60, true, false);
   printf("LoRa transceiver node ready\n");
@@ -142,9 +143,33 @@ void send_message(const char* message, uint16_t ID, uint8_t TTL, int PACKET_ID,
   printf("Type   : %u\n", packet.type);
   printf("Text   : %s\n", packet.message);
 
-  bool sent =
-      LoRaSend((uint8_t*)&packet, sizeof(PacketStruct), SX126x_TXMODE_SYNC);
-  printf(sent ? "Packet sent\n\n" : "Packet failed\n\n");
+  if (xQueueSend(lora_tx_queue, &packet, pdMS_TO_TICKS(100)) != pdTRUE) {
+    printf("LoRa TX queue full — packet dropped\n");
+  }
+}
+
+static void lora_tx_task(void* pvParameters) {
+  PacketStruct packet;
+
+  while (1) {
+    if (xQueueReceive(lora_tx_queue, &packet, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    printf("\n--- LoRa TX Task ---\n");
+    printf("Source : %u\n", packet.source_id);
+    printf("Packet : %lu\n", (unsigned long)packet.packet_id);
+    printf("TTL    : %u\n", packet.ttl);
+    printf("Type   : %u\n", packet.type);
+    printf("Text   : %s\n", packet.message);
+
+    bool sent =
+        LoRaSend((uint8_t*)&packet, sizeof(PacketStruct), SX126x_TXMODE_SYNC);
+
+    printf(sent ? "Packet sent\n\n" : "Packet failed\n\n");
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
 typedef struct {
@@ -189,7 +214,7 @@ static void ems_forward_task(void* pvParameters) {
 
 // Sends to EMS and through network if wifi/gateway
 static void forward_to_ems(const PacketStruct* packet) {
-  if (current_role != ROLE_GATEWAY || !wifi_is_connected) {
+  if (current_role != ROLE_UPLINK || !wifi_is_connected) {
     return;
   }
 
@@ -269,8 +294,7 @@ void handle_receive(void) {
   PacketStruct packet;
   memcpy(&packet, rx_buffer, sizeof(PacketStruct));
 
-  if (packet.type != PACKET_GATEWAY_BEACON &&
-      packet_already_seen(packet.source_id, packet.packet_id)) {
+  if (packet_already_seen(packet.source_id, packet.packet_id)) {
     printf("Duplicate packet ignored (source %u, id %lu)\n", packet.source_id,
            (unsigned long)packet.packet_id);
     return;
@@ -298,22 +322,15 @@ void handle_receive(void) {
     case PACKET_IMAGE:
       printf("Image packet received\n");
       break;
-    case PACKET_GATEWAY_BEACON:
-      // Another node is announcing gateway status. For now just log it —
-      // this is the hook point for a future "nearest gateway" table if you
-      // want smarter routing than pure flood-and-TTL later on.
-      printf("Gateway beacon from node %u\n", packet.source_id);
-      break;
     default:
       printf("Unknown packet type\n");
       break;
   }
 
   printf("-----------------------\n");
-  if (packet.ttl > 0 && packet.type != PACKET_GATEWAY_BEACON) {
-    // Beacons are single-hop by design (ttl=1, see gateway_beacon below) so
-    // they don't need forwarding logic; everything else still floods.
+  if (packet.ttl > 0) {
     printf("TTL subtracted by one and packet forwarded.\n");
+    vTaskDelay(pdMS_TO_TICKS(100));
     send_message(packet.message, packet.source_id, packet.ttl - 1,
                  packet.packet_id, packet.type);
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -322,7 +339,7 @@ void handle_receive(void) {
 
 #pragma endregion  // LoRa messages
 
-#pragma region HTTP server (gateway-only)
+#pragma region HTTP server
 
 // clang-format off
 static const char* GATEWAY_FORM_HTML =
@@ -443,7 +460,7 @@ static void stop_gateway_webserver(httpd_handle_t server) {
   }
 }
 
-#pragma endregion  // HTTP server (gateway-only)
+#pragma endregion  // HTTP server
 
 #pragma region Captive portal (DNS hijack + browser popup)
 
@@ -550,65 +567,24 @@ static esp_err_t captive_portal_redirect_handler(httpd_req_t* req) {
 
 #pragma region Role transitions
 
-static void become_gateway(void) {
-  if (current_role == ROLE_GATEWAY) return;
-  ESP_LOGI(TAG, "Uplink acquired — becoming gateway node");
-
-  wifi_config_t ap_config = {
-      .ap =
-          {
-              .ssid = AP_SSID,
-              .ssid_len = strlen(AP_SSID),
-              .password = AP_PASSWORD,
-              .channel = AP_CHANNEL,
-              .max_connection = AP_MAX_CONN,
-              .authmode = WIFI_AUTH_WPA2_PSK,
-          },
-  };
-
-  // REVIEW: switching WIFI_MODE while STA is already running is supported by
-  // esp-idf but worth confirming on your exact IDF version/target — some
-  // versions want esp_wifi_stop()/esp_wifi_start() around a mode change.
-  esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to switch to APSTA: %s", esp_err_to_name(err));
+static void remain_access(void) {
+  if (current_role == ROLE_ACCESS) {
     return;
   }
-  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
 
-  dhcps_offer_t dhcps_dns_value = OFFER_DNS;
-  esp_netif_dhcps_stop(ap_netif);
-  esp_err_t dns_err = esp_netif_dhcps_option(
-      ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
-      &dhcps_dns_value, sizeof(dhcps_dns_value));
-  if (dns_err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to set AP DNS option: %s", esp_err_to_name(dns_err));
-  }
-  esp_netif_dhcps_start(ap_netif);
+  ESP_LOGI(TAG, "Node operating as access node");
 
-  gw_http_server = start_gateway_webserver();
-
-  if (dns_hijack_task_handle == NULL) {
-    xTaskCreate(dns_hijack_task, "dns_hijack", 4096, NULL, 5,
-                &dns_hijack_task_handle);
-  }
-  current_role = ROLE_GATEWAY;
+  current_role = ROLE_ACCESS;
 }
 
-static void step_down_from_gateway(void) {
-  if (current_role != ROLE_GATEWAY) return;
-  ESP_LOGW(TAG, "Uplink lost — stepping down from gateway");
-
-  stop_gateway_webserver(gw_http_server);
-  gw_http_server = NULL;
-
-  if (dns_hijack_task_handle != NULL) {
-    vTaskDelete(dns_hijack_task_handle);
-    dns_hijack_task_handle = NULL;
+static void become_uplink(void) {
+  if (current_role == ROLE_UPLINK) {
+    return;
   }
 
-  esp_wifi_set_mode(WIFI_MODE_STA);
-  current_role = ROLE_MESH_ONLY;
+  ESP_LOGI(TAG, "Uplink acquired — node is now an uplink");
+
+  current_role = ROLE_UPLINK;
 }
 
 #pragma endregion  // Role transitions
@@ -620,25 +596,36 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
   if (event_base == WIFI_EVENT) {
     switch (event_id) {
       case WIFI_EVENT_STA_START:
-        printf("Wi-Fi started, connecting to AP...\n");
+        printf("Upstream Wi-Fi search started.\n");
         esp_wifi_connect();
         break;
+
       case WIFI_EVENT_STA_DISCONNECTED:
         wifi_is_connected = false;
-        step_down_from_gateway();
-        printf("Wi-Fi disconnected... retrying connection\n");
+
+        if (current_role == ROLE_UPLINK) {
+          ESP_LOGW(TAG, "Upstream Wi-Fi lost — returning to access mode");
+          remain_access();
+        } else {
+          ESP_LOGI(TAG, "No upstream Wi-Fi — operating as access node");
+        }
+
         esp_wifi_connect();
         break;
+
       default:
         break;
     }
   } else if (event_base == IP_EVENT) {
     if (event_id == IP_EVENT_STA_GOT_IP) {
       wifi_is_connected = true;
+
       ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
-      printf("Wi-Fi connected! IP Address: " IPSTR "\n",
+
+      printf("Upstream Wi-Fi connected! IP Address: " IPSTR "\n",
              IP2STR(&event->ip_info.ip));
-      become_gateway();
+
+      become_uplink();
     }
   }
 }
@@ -660,15 +647,60 @@ void wifi_init(void) {
   ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                              &wifi_event_handler, NULL));
 
-  wifi_config_t wifi_config = {
-      .sta = {.ssid = STA_SSID, .password = STA_PASSWORD},
+  wifi_config_t sta_config = {
+      .sta =
+          {
+              .ssid = STA_SSID,
+              .password = STA_PASSWORD,
+          },
+  };
+  wifi_config_t ap_config = {
+      .ap =
+          {
+              .ssid = AP_SSID,
+              .ssid_len = strlen(AP_SSID),
+              .password = AP_PASSWORD,
+              .channel = AP_CHANNEL,
+              .max_connection = AP_MAX_CONN,
+              .authmode = WIFI_AUTH_WPA2_PSK,
+          },
   };
 
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+
+  dhcps_offer_t dhcps_dns_value = OFFER_DNS;
+
+  ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
+
+  esp_err_t dns_err = esp_netif_dhcps_option(
+      ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+      &dhcps_dns_value, sizeof(dhcps_dns_value));
+
+  if (dns_err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to set AP DNS option: %s", esp_err_to_name(dns_err));
+  }
+
+  ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
+
   ESP_ERROR_CHECK(esp_wifi_start());
 
-  printf("Wi-Fi initialized (mesh-only until uplink confirmed)\n");
+  gw_http_server = start_gateway_webserver();
+
+  if (dns_hijack_task_handle == NULL) {
+    xTaskCreate(dns_hijack_task, "dns_hijack", 4096, NULL, 5,
+                &dns_hijack_task_handle);
+  }
+
+  current_role = ROLE_ACCESS;
+
+  printf("CASTOR access network started.\n");
+  printf("AP SSID: %s\n", AP_SSID);
+  printf("AP IP: 192.168.4.1\n");
+  printf("Attempting upstream Wi-Fi connection...\n");
 }
 
 #pragma endregion  // WiFi
@@ -687,6 +719,15 @@ void app_main(void) {
   init_node_id();
   GPIO_init(BUTTON_GPIO, GPIO_MODE_INPUT, true, false);
   LoRa_setup();
+
+  lora_tx_queue = xQueueCreate(LORA_TX_QUEUE_SIZE, sizeof(PacketStruct));
+  if (lora_tx_queue == NULL) {
+    ESP_LOGE(TAG, "Failed to create LoRa TX queue");
+    abort();
+  }
+
+  xTaskCreate(lora_tx_task, "lora_tx", 4096, NULL, 6, NULL);
+
   wifi_init();
 
   // clang-format off
@@ -698,25 +739,12 @@ void app_main(void) {
 
   printf("sizeof(PacketStruct) = %u\n", (unsigned)sizeof(PacketStruct));
 
-  TickType_t last_beacon = xTaskGetTickCount();
-
   while (1) {
     handle_receive();
 
     if (gpio_get_level(BUTTON_GPIO) == 0) {
       originate_message("SOS at this location", PACKET_SOS);
       wait_for_button_release(BUTTON_GPIO);
-    }
-
-    if (current_role == ROLE_GATEWAY) {
-      TickType_t now = xTaskGetTickCount();
-      if ((now - last_beacon) * portTICK_PERIOD_MS >=
-          GATEWAY_BEACON_INTERVAL_MS) {
-        // ttl=1: beacon is meant to be heard nearby, not flooded across the
-        // whole mesh (see the ttl==0 skip in handle_receive above).
-        send_message("GW", NODE_ID, 1, 0, PACKET_GATEWAY_BEACON);
-        last_beacon = now;
-      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(50));
