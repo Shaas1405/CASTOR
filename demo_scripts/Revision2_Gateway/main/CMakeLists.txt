@@ -1,8 +1,8 @@
 idf_component_register(SRCS "main.c"
-                       REQUIRES spi_flash
                        INCLUDE_DIRS ""
-                       REQUIRES ra01s
                        REQUIRES
+                            spi_flash
+                            ra01s
                             esp_wifi
                             esp_event
                             esp_netif

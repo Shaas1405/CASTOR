@@ -13,3 +13,6 @@
 [submodule "demo_scripts/Revision2_Gateway/components/esp-idf-sx126x"]
 	path = demo_scripts/Revision2_Gateway/components/esp-idf-sx126x
 	url = https://github.com/nopnop2002/esp-idf-sx126x.git
+[submodule "demo_scripts/Revision2_Gateway+Access/components/esp-idf-sx1262x"]
+	path = demo_scripts/Revision2_Gateway+Access/components/esp-idf-sx1262x
+	url = https://github.com/nopnop2002/esp-idf-sx126x.git

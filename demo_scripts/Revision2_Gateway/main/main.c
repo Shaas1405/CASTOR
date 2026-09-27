@@ -3,6 +3,8 @@
 #include <string.h>
 
 #include "arpa/inet.h"
+#include "dhcpserver/dhcpserver.h"
+#include "dhcpserver/dhcpserver_options.h"
 #include "driver/gpio.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
@@ -14,6 +16,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/ip_addr.h"
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
 #include "ra01s.h"
@@ -144,6 +147,46 @@ void send_message(const char* message, uint16_t ID, uint8_t TTL, int PACKET_ID,
   printf(sent ? "Packet sent\n\n" : "Packet failed\n\n");
 }
 
+typedef struct {
+  uint16_t source_id;
+  uint8_t type;
+  char message[48];
+} EmsForwardMsg;
+
+static QueueHandle_t ems_forward_queue = NULL;
+
+static void ems_forward_task(void* pvParameters) {
+  EmsForwardMsg msg;
+  while (1) {
+    if (xQueueReceive(ems_forward_queue, &msg, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    char body[192];
+    snprintf(body, sizeof(body),
+             "{\"source_id\":%u,\"type\":%u,\"message\":\"%s\"}", msg.source_id,
+             msg.type, msg.message);
+
+    esp_http_client_config_t config = {
+        .url = EMS_ENDPOINT_URL,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 5000,
+        .crt_bundle_attach = esp_crt_bundle_attach};
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, strlen(body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+      ESP_LOGI(TAG, "EMS forward OK, status=%d",
+               esp_http_client_get_status_code(client));
+    } else {
+      ESP_LOGW(TAG, "EMS forward failed: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+  }
+}
+
 // Sends to EMS and through network if wifi/gateway
 static void forward_to_ems(const PacketStruct* packet) {
   if (current_role != ROLE_GATEWAY || !wifi_is_connected) {
@@ -154,28 +197,15 @@ static void forward_to_ems(const PacketStruct* packet) {
            packet->source_id, packet->type, packet->message);
 
 #if ENABLE_EMS_FORWARDING
-  char body[192];
-  snprintf(body, sizeof(body),
-           "{\"source_id\":%u,\"type\":%u,\"message\":\"%s\"}",
-           packet->source_id, packet->type, packet->message);
+  if (ems_forward_queue == NULL) return;
 
-  esp_http_client_config_t config = {
-      .url = EMS_ENDPOINT_URL,
-      .method = HTTP_METHOD_POST,
-      .timeout_ms = 5000,
-      .crt_bundle_attach = esp_crt_bundle_attach};
-  esp_http_client_handle_t client = esp_http_client_init(&config);
-  esp_http_client_set_header(client, "Content-Type", "application/json");
-  esp_http_client_set_post_field(client, body, strlen(body));
+  EmsForwardMsg msg = {.source_id = packet->source_id, .type = packet->type};
+  strncpy(msg.message, packet->message, sizeof(msg.message) - 1);
+  msg.message[sizeof(msg.message) - 1] = '\0';
 
-  esp_err_t err = esp_http_client_perform(client);
-  if (err == ESP_OK) {
-    ESP_LOGI(TAG, "EMS forward OK, status=%d",
-             esp_http_client_get_status_code(client));
-  } else {
-    ESP_LOGW(TAG, "EMS forward failed: %s", esp_err_to_name(err));
+  if (xQueueSend(ems_forward_queue, &msg, 0) != pdTRUE) {
+    ESP_LOGW(TAG, "EMS forward queue full, dropping message");
   }
-  esp_http_client_cleanup(client);
 #endif
 }
 
@@ -546,20 +576,14 @@ static void become_gateway(void) {
   }
   esp_wifi_set_config(WIFI_IF_AP, &ap_config);
 
-  esp_netif_dns_info_t dns_info = {.ip.type = ESP_IPADDR_TYPE_V4};
-
-  dns_info.ip.u_addr.ip4.addr = inet_addr("192.168.4.1");
-
+  dhcps_offer_t dhcps_dns_value = OFFER_DNS;
   esp_netif_dhcps_stop(ap_netif);
-
-  esp_err_t dns_err = esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
-                                             ESP_NETIF_DOMAIN_NAME_SERVER,
-                                             &dns_info, sizeof(dns_info));
-
+  esp_err_t dns_err = esp_netif_dhcps_option(
+      ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+      &dhcps_dns_value, sizeof(dhcps_dns_value));
   if (dns_err != ESP_OK) {
     ESP_LOGW(TAG, "Failed to set AP DNS option: %s", esp_err_to_name(dns_err));
   }
-
   esp_netif_dhcps_start(ap_netif);
 
   gw_http_server = start_gateway_webserver();
@@ -577,6 +601,12 @@ static void step_down_from_gateway(void) {
 
   stop_gateway_webserver(gw_http_server);
   gw_http_server = NULL;
+
+  if (dns_hijack_task_handle != NULL) {
+    vTaskDelete(dns_hijack_task_handle);
+    dns_hijack_task_handle = NULL;
+  }
+
   esp_wifi_set_mode(WIFI_MODE_STA);
   current_role = ROLE_MESH_ONLY;
 }
@@ -658,6 +688,13 @@ void app_main(void) {
   GPIO_init(BUTTON_GPIO, GPIO_MODE_INPUT, true, false);
   LoRa_setup();
   wifi_init();
+
+  // clang-format off
+  #if ENABLE_EMS_FORWARDING
+    ems_forward_queue = xQueueCreate(4, sizeof(EmsForwardMsg));
+    xTaskCreate(ems_forward_task, "ems_forward", 8192, NULL, 5, NULL);
+  #endif
+  //clang-format on
 
   printf("sizeof(PacketStruct) = %u\n", (unsigned)sizeof(PacketStruct));
 
