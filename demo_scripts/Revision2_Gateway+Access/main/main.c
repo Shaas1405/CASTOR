@@ -180,6 +180,31 @@ typedef struct {
 
 static QueueHandle_t ems_forward_queue = NULL;
 
+static void json_escape(const char* in, char* out, size_t out_len) {
+  size_t o = 0;
+  for (size_t i = 0; in[i] != '\0' && o + 7 < out_len; i++) {
+    unsigned char c = (unsigned char)in[i];
+    if (c == '"' || c == '\\') {
+      out[o++] = '\\';
+      out[o++] = c;
+    } else if (c == '\n') {
+      out[o++] = '\\';
+      out[o++] = 'n';
+    } else if (c == '\r') {
+      out[o++] = '\\';
+      out[o++] = 'r';
+    } else if (c == '\t') {
+      out[o++] = '\\';
+      out[o++] = 't';
+    } else if (c < 0x20) {
+      o += snprintf(out + o, out_len - o, "\\u%04x", c);
+    } else {
+      out[o++] = c;
+    }
+  }
+  out[o] = '\0';
+}
+
 static void ems_forward_task(void* pvParameters) {
   EmsForwardMsg msg;
   while (1) {
@@ -188,9 +213,12 @@ static void ems_forward_task(void* pvParameters) {
     }
 
     char body[192];
+    char safe_msg[160];
+    json_escape(msg.message, safe_msg, sizeof(safe_msg));
+
     snprintf(body, sizeof(body),
              "{\"source_id\":%u,\"type\":%u,\"message\":\"%s\"}", msg.source_id,
-             msg.type, msg.message);
+             msg.type, safe_msg);
 
     esp_http_client_config_t config = {
         .url = EMS_ENDPOINT_URL,
@@ -360,7 +388,7 @@ static const char* GATEWAY_FORM_HTML =
                 "<option value='0'>General message</option>"
             "</select></label><br><br>"
             "<label>Message:<br>"
-            "<textarea name='message' rows='3' style='width:100%'></textarea></label><br><br>"
+            "<textarea name='message' rows='3' maxlength='47' style='width:100%'></textarea></label><br><br>"
             "<button type='submit' style='padding:0.75em 1.5em'>Send</button>"
         "</form>"
     "</body>"
@@ -370,6 +398,13 @@ static const char* GATEWAY_FORM_HTML =
 static esp_err_t root_get_handler(httpd_req_t* req) {
   httpd_resp_set_type(req, "text/html");
   return httpd_resp_send(req, GATEWAY_FORM_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static int hex_val(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
 }
 
 // Extremely small form-urlencoded parser: good enough for our two fields,
@@ -383,14 +418,22 @@ static bool extract_form_value(const char* body, const char* key, char* out,
   if (!start) return false;
   start += strlen(needle);
   const char* end = strchr(start, '&');
-  size_t len = end ? (size_t)(end - start) : strlen(start);
-  if (len >= out_len) len = out_len - 1;
-  memcpy(out, start, len);
-  out[len] = '\0';
-  // Minimal cleanup: '+' -> space (skips full percent-decoding for brevity)
-  for (size_t i = 0; i < len; i++) {
-    if (out[i] == '+') out[i] = ' ';
+  size_t raw_len = end ? (size_t)(end - start) : strlen(start);
+
+  size_t o = 0;
+  for (size_t i = 0; i < raw_len && o < out_len - 1; i++) {
+    char c = start[i];
+    if (c == '+') {
+      out[o++] = ' ';
+    } else if (c == '%' && i + 2 < raw_len && hex_val(start[i + 1]) >= 0 &&
+               hex_val(start[i + 2]) >= 0) {
+      out[o++] = (char)(hex_val(start[i + 1]) * 16 + hex_val(start[i + 2]));
+      i += 2;
+    } else {
+      out[o++] = c;
+    }
   }
+  out[o] = '\0';
   return true;
 }
 
