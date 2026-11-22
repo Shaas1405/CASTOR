@@ -24,12 +24,12 @@
 static const char* TAG = "CASTOR_GW";
 
 #pragma region Configuration
-#define STA_SSID "ATT59MhrJq"
-#define STA_PASSWORD "t8+2apu9tdd#"
+#define STA_SSID CONFIG_STA_SSID
+#define STA_PASSWORD CONFIG_STA_PASSWORD
 
 // Local network the gateway stands up
-#define AP_SSID "CASTOR-GATEWAY"
-#define AP_PASSWORD "castor-relief"  // SHould get rid of
+#define AP_SSID CONFIG_AP_SSID
+#define AP_PASSWORD CONFIG_AP_PASSWORD
 #define AP_CHANNEL 6
 #define AP_MAX_CONN 8
 
@@ -652,6 +652,9 @@ void wifi_init(void) {
           {
               .ssid = STA_SSID,
               .password = STA_PASSWORD,
+              .threshold.authmode = (STA_PASSWORD[0] == '\0')
+                                        ? WIFI_AUTH_OPEN
+                                        : WIFI_AUTH_WPA2_PSK,
           },
   };
   wifi_config_t ap_config = {
@@ -662,7 +665,8 @@ void wifi_init(void) {
               .password = AP_PASSWORD,
               .channel = AP_CHANNEL,
               .max_connection = AP_MAX_CONN,
-              .authmode = WIFI_AUTH_WPA2_PSK,
+              .authmode = (AP_PASSWORD[0] == '\0') ? WIFI_AUTH_OPEN
+                                                   : WIFI_AUTH_WPA2_PSK,
           },
   };
 

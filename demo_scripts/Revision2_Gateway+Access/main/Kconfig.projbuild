@@ -1,0 +1,25 @@
+menu "CASTOR Credentials"
+
+	config STA_SSID
+		string "Upstream Wi-Fi SSID"
+		default ""
+		help
+			SSID of the upstream network the gateway connects to.
+
+	config STA_PASSWORD
+		string "Upstream Wi-Fi password"
+		default ""
+		help
+			Password of the upstream network. Leave empty for an open network.
+
+	config AP_SSID
+		string "Access point SSID"
+		default "CASTOR-GATEWAY"
+
+	config AP_PASSWORD
+		string "Access point password"
+		default ""
+		help
+			Leave empty for an open access point (no password, direct connection).
+
+endmenu
